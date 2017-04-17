@@ -21,21 +21,25 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelProgressiveFuture;
 import io.netty.channel.ChannelProgressiveFutureListener;
 import io.netty.channel.DefaultFileRegion;
 import io.netty.channel.EventLoopGroup;
-import io.netty.channel.FileRegion;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.http.DefaultFullHttpRequest;
 import io.netty.handler.codec.http.DefaultHttpRequest;
+import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.HttpChunkedInput;
+import io.netty.handler.codec.http.HttpContentEncoder;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.HttpRequestEncoder;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
@@ -49,8 +53,9 @@ import io.netty.handler.codec.http.multipart.InterfaceHttpData;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
-//import io.netty.util.internal.SocketUtils;
 import io.netty.handler.stream.ChunkedFile;
+//import io.netty.util.internal.SocketUtils;
+import io.netty.util.AttributeKey;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -58,15 +63,16 @@ import java.io.FileNotFoundException;
 import java.io.RandomAccessFile;
 import java.io.UnsupportedEncodingException;
 import java.net.URI;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
 import java.util.List;
@@ -79,19 +85,16 @@ import javax.activation.MimetypesFileTypeMap;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
-/**
- * This class is meant to be run against {@link HttpUploadServer}.
- */
-public final class HttpUploadClient {
+public final class HTTPUploadClientAsync {
 
-    private String base_url, account_name, account_key, FILE;
-    private Mac hmacSha256;
-    private byte[] key;
-
-    static final String AB = "abcdefghijklmnopqrstuvwxyz";
-    static SecureRandom rnd = new SecureRandom();
+    private String base_url, account_name, account_key;
     
-    public HttpUploadClient(String account_name, String account_key){
+    static final String AB = "abcdefghijklmnopqrstuvwxyz";
+    final static AttributeKey<HttpRequest> HTTPREQUEST = AttributeKey.valueOf("httprequest");
+    final static AttributeKey<File> FILETOUPLOAD = AttributeKey.valueOf("FILE");
+
+    
+    public HTTPUploadClientAsync(String account_name, String account_key){
     	
         this.base_url = "http://" + account_name + ".blob.core.windows.net";
         this.account_name = account_name;
@@ -101,8 +104,6 @@ public final class HttpUploadClient {
 
     public void putBlob(String filepath) throws Exception {
           
-        //putblob: http://sercan.blob.core.windows.net/containername/blobname
-    	this.FILE = filepath;
     	String resourceUrl = "/mycontainer/" + randomString(5);
         String putBlobUrl = base_url + resourceUrl;
 
@@ -132,16 +133,16 @@ public final class HttpUploadClient {
             sslCtx = null;
         }
 
-        File file = new File(FILE);
-        if (!file.canRead()) {
-            throw new FileNotFoundException(FILE);
+        File path = new File(filepath);
+        if (!path.canRead()) {
+            throw new FileNotFoundException(filepath);
         }
 
         // Configure the client.
         EventLoopGroup group = new NioEventLoopGroup();
 
         // setup the factory: here using a mixed memory/disk based on size threshold
-        HttpDataFactory factory = new DefaultHttpDataFactory(true); // Disk if MINSIZE exceed
+        HttpDataFactory factory = new DefaultHttpDataFactory(DefaultHttpDataFactory.MINSIZE); // Disk if MINSIZE exceed
 
         DiskFileUpload.deleteOnExitTemporaryFile = true; // should delete file on exit (in normal exit)
         DiskFileUpload.baseDirectory = null; // system temp directory
@@ -149,11 +150,49 @@ public final class HttpUploadClient {
         DiskAttribute.baseDirectory = null; // system temp directory
 
         try {
-            Bootstrap b = new Bootstrap();
-            b.group(group).channel(NioSocketChannel.class).handler(new HttpUploadClientInitializer(sslCtx)); 
 
-            // Simple Post form: factory used for big attributes
-            formpost(b, host, port, uriSimple, resourceUrl, file, factory);
+            Bootstrap b = new Bootstrap();
+            b.group(group).channel(NioSocketChannel.class).handler(new HttpUploadClientInitializer(sslCtx));
+            b.option(ChannelOption.WRITE_BUFFER_HIGH_WATER_MARK, 10 * 64 * 1024);
+            b.option(ChannelOption.SO_SNDBUF, 1048576);
+            b.option(ChannelOption.SO_RCVBUF, 1048576);
+            b.option(ChannelOption.TCP_NODELAY, true);
+            b.option(ChannelOption.SO_REUSEADDR, true);
+            b.option(ChannelOption.AUTO_CLOSE, true);
+            
+            //Iterate over files
+            
+            Collection<ChannelFuture> futures = new ArrayList<ChannelFuture>();
+
+            for(final File file : path.listFiles()) 
+            {
+              
+              String blobname = file.getName();
+              System.out.println( blobname );
+
+              HttpRequest request = formpost( host, port, resourceUrl+blobname, file, factory);
+              ChannelFuture cf = b.connect(host, port);
+              futures.add(cf);
+              cf.channel().attr(HTTPREQUEST).set(request);
+              cf.channel().attr(FILETOUPLOAD).set(file);
+
+              cf.addListener(new ChannelFutureListener(){
+             	 public void operationComplete(ChannelFuture future) throws Exception {
+             	  
+             	  // check to see if we succeeded
+             	  if(future.isSuccess()) {
+             		  	System.out.println("connected for " + blobname);             	   
+             	  } else {
+           		  	System.out.println(future.cause().getMessage());             	               		  
+             	  }
+             	 }
+             	});   
+            }
+            
+            for (ChannelFuture cf : futures){
+                cf.channel().closeFuture().awaitUninterruptibly();
+            }
+            
 
         } finally {
             // Shut down executor threads to exit.
@@ -170,16 +209,12 @@ public final class HttpUploadClient {
      *
      * @return the list of HttpData object (attribute and file) to be reused on next post
      */
-    private void formpost(
-            Bootstrap bootstrap,
-            String host, int port, URI uriSimple, String resourceUrl, File file, HttpDataFactory factory) throws Exception {
-        // Start the connection attempt.
-        Channel channel = bootstrap.connect(host, port).sync().channel();
-        // Wait until the connection attempt succeeds or fails.
-        //Channel channel = future.sync().channel();
+    private HttpRequest formpost(
+            String host, int port, String uriSimple, File file, HttpDataFactory factory) throws Exception {
 
-        // Prepare the HTTP request.        
-        HttpRequest request = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.PUT, uriSimple.toASCIIString());
+        long fileLength;
+        
+        HttpRequest request = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.PUT, uriSimple);
         request.headers().set(HttpHeaderNames.HOST, host);
         request.headers().add("x-ms-version", "2016-05-31");
         
@@ -189,46 +224,22 @@ public final class HttpUploadClient {
         
         request.headers().set("x-ms-date", dateTime);
         request.headers().set("x-ms-blob-type", "BlockBlob");
+        
+        //connection will not close but needed
+        // headers.set("Connection","keep-alive");
+        // headers.set("Keep-Alive","300");
         request.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
         
-        RandomAccessFile raf = new RandomAccessFile(file, "r");
-        long fileLength = raf.length();
+        fileLength = file.length();
+        
+        MimetypesFileTypeMap mimeTypesMap = new MimetypesFileTypeMap();
+
+        request.headers().set(HttpHeaderNames.CONTENT_TYPE, mimeTypesMap.getContentType(file.getPath()));
         HttpUtil.setContentLength(request, fileLength);
-        setContentTypeHeader(request, file);
 
-        // Use the PostBody encoder
-        //HttpPostRequestEncoder bodyRequestEncoder =
-        //        new HttpPostRequestEncoder(factory, request, false);  // false => not multipart
-
-        // add Form attribute
-        //bodyRequestEncoder.addBodyFileUpload("myfile", file, "application/x-zip-compressed", false);
-        request.headers().set("Authorization", "SharedKey " + account_name + ":" + AuthorizationHeader(account_name, account_key, "PUT", dateTime, request, resourceUrl, "", ""));
-
-	    channel.write(request);
-        // ByteBuf buffer = Unpooled.copiedBuffer(Files.readAllBytes(file.toPath()));        		  //ByteBuf buffer = Unpooled.buffer(new FileInputStream(file), (int) file.length());
-
-        ChannelFuture sendFileFuture = channel.write(new DefaultFileRegion(raf.getChannel(), 0, fileLength), channel.newProgressivePromise());
-        	      
-        // Write the end marker.
-        ChannelFuture lastContentFuture = channel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
+        request.headers().add("Authorization", "SharedKey " + account_name + ":" + AuthorizationHeader(account_name, account_key, "PUT", dateTime, request, uriSimple, "", ""));
         
-        sendFileFuture.addListener(new ChannelProgressiveFutureListener() {
-        	@Override
-        	public void operationProgressed(ChannelProgressiveFuture future, long progress, long total) {
-        		if (total < 0) { // total unknown
-        			System.err.println(future.channel() + " Transfer progress: " + progress);
-        	    } else {
-        	    	System.err.println(future.channel() + " Transfer progress: " + progress + " / " + total);
-        	    }
-        	}
-
-        	@Override
-        	public void operationComplete(ChannelProgressiveFuture future) {
-        		System.err.println(future.channel() + " Transfer complete.");
-        	}
-        });
-
-        
+        return request;
     }
 
     public String AuthorizationHeader(String storageAccountName, String storageAccountKey, String method, String now, HttpRequest request, String resourceUrl, String ifMatch, String md5) throws InvalidKeyException
@@ -290,6 +301,8 @@ public final class HttpUploadClient {
     
     public synchronized String computeHmac256(String storage_key, final String value) throws InvalidKeyException {
             byte[] utf8Bytes = null;
+            Mac hmacSha256 = null;
+            byte[] key;
             try {
                 utf8Bytes = value.getBytes("UTF-8");
 
@@ -318,15 +331,12 @@ public final class HttpUploadClient {
     
     String randomString( int len ){
     	StringBuilder sb = new StringBuilder( len );
+        SecureRandom rnd = new SecureRandom();
+
     	for( int i = 0; i < len; i++ ) 
     		sb.append( AB.charAt( rnd.nextInt(AB.length()) ) );
     	return sb.toString();
     }
-    
-    private static void setContentTypeHeader(HttpRequest request, File file) {
-        MimetypesFileTypeMap mimeTypesMap = new MimetypesFileTypeMap();
-        request.headers().set(HttpHeaderNames.CONTENT_TYPE, mimeTypesMap.getContentType(file.getPath()));
-}
    
 }
 

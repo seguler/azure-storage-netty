@@ -20,7 +20,23 @@
   <dependencies>
   	<dependency>
   		<groupId>io.netty</groupId>
-  		<artifactId>netty-all</artifactId>
+  		<artifactId>netty-codec-http</artifactId>
+  		<version>4.1.9.Final</version>
+  	</dependency>
+  	<dependency>
+  		<groupId>io.netty</groupId>
+  		<artifactId>netty-handler</artifactId>
+  		<version>4.1.9.Final</version>
+  		<exclusions>
+  			<exclusion>
+  				<groupId>io.netty</groupId>
+  				<artifactId>netty-common</artifactId>
+  			</exclusion>
+  		</exclusions>
+  	</dependency>
+  	<dependency>
+  		<groupId>io.netty</groupId>
+  		<artifactId>netty-common</artifactId>
   		<version>4.1.9.Final</version>
   	</dependency>
   </dependencies>
